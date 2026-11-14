@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>LyricSync · 음원과 가사로 싱크 가사 자동 만들기</title>
-<meta name="description" content="음원 파일과 가사를 넣으면 줄·단어 단위 타임스탬프(LRC, SRT, ASS 가라오케)를 자동으로 만들어 드려요. 무료, 가입 없음.">
+<meta name="description" content="음원 파일과 가사를 넣으면 줄·단어 단위 타임스탬프(LRC, SRT, ASS 가라오케)를 자동으로 만들어 드려요. 카카오 로그인 후 하루 3곡 무료.">
 <meta property="og:title" content="LyricSync · 싱크 가사 자동 생성">
 <meta property="og:description" content="음원 + 가사 → LRC · SRT · ASS 가라오케 자막">
-<script>window.LYRICSYNC_API = "https://leo-yssa--lyricsync.us-east.modal.run";</script>
+<script>window.LYRICSYNC_API = "https://api-lyricsync.dotorio.com"; window.LYRICSYNC_AUTH = "https://auth.dotorio.com";</script>
 <style>
   :root{--bg:#0f1115;--card:#171a21;--line:#262a33;--fg:#e8eaf0;--mut:#8b91a0;--acc:#5b8cff;--ok:#3ecf8e;--warn:#f5b84b;--err:#ff6b6b;--mono:ui-monospace,SFMono-Regular,Menlo,monospace}
   *{box-sizing:border-box}
@@ -32,6 +32,9 @@
   button{background:var(--acc);color:#fff;border:0;border-radius:8px;padding:11px 18px;font:inherit;font-weight:600;cursor:pointer}
   button.ghost{background:transparent;border:1px solid var(--line);color:var(--fg)}
   button:disabled{opacity:.45;cursor:default}
+  .acct{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;font-size:13px;color:var(--mut)}
+  .acct b{color:var(--fg)} .acct .lnk{background:none;border:0;padding:0;color:var(--mut);font-weight:400;text-decoration:underline;cursor:pointer}
+  button.kakao{background:#fee500;color:#191600}
   .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
   /* progress */
   .stage{display:grid;grid-template-columns:28px 1fr 90px;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
@@ -68,6 +71,7 @@
   <div class="env" id="env"></div>
 </header>
 <main>
+  <div id="acct" class="acct hidden"></div>
   <div class="steps"><span id="s1" class="cur">1 입력</span><span id="s2">2 진행</span><span id="s3">3 결과</span></div>
 
   <!-- ===== 1. INPUT ===== -->
@@ -602,13 +606,63 @@
 <script>
 const $=s=>document.querySelector(s);
 const STAGES=["prepare","separate","transcribe","align","postprocess","export"];
-let audioFile=null, uploadId=null, job=null, lines=[], es=null, PUBLIC=false;
-/* 호스팅 버전은 페이지에서 window.LYRICSYNC_API = 'https://…modal.run' 을 먼저 정의한다. 로컬은 같은 서버. */
+let audioFile=null, uploadId=null, job=null, lines=[], PUBLIC=false;
+/* 호스팅 버전은 페이지에서 window.LYRICSYNC_API = 'https://api-lyricsync.dotorio.com'(게이트웨이)을 먼저 정의한다. 로컬은 같은 서버. */
 const API=(window.LYRICSYNC_API||'').replace(/\/$/,'');
+/* 호스팅 버전은 window.LYRICSYNC_AUTH = 'https://auth.dotorio.com' 도 정의한다 → 카카오 로그인 후에만 쓸 수 있다. */
+const AUTH=(window.LYRICSYNC_AUTH||'').replace(/\/$/,'');
+let session=null, me=null, ctl=null, audioBlobUrl=null;
+
+/* ---- login (GoTrue, 카카오) ---- */
+const SKEY='lyricsync.session';
+function saveSession(){ try{ session?localStorage.setItem(SKEY,JSON.stringify(session)):localStorage.removeItem(SKEY); }catch(_){} }
+function setSession(j){ session={access_token:j.access_token,refresh_token:j.refresh_token,
+  expires_at:+j.expires_at||Math.floor(Date.now()/1000)+(+j.expires_in||3600)}; saveSession(); }
+if(AUTH){
+  try{ session=JSON.parse(localStorage.getItem(SKEY)); }catch(_){}
+  const h=new URLSearchParams(location.hash.slice(1));
+  if(h.get('access_token')) setSession(Object.fromEntries(h));
+  if(h.get('error_description')) setTimeout(()=>alert('로그인하지 못했어요: '+h.get('error_description')),0);
+  if(location.hash) history.replaceState(null,'',location.pathname+location.search);
+}
+function login(){ location.href=`${AUTH}/authorize?provider=kakao&redirect_to=${encodeURIComponent(location.origin+location.pathname)}`; }
+async function logout(){ const t=session&&session.access_token; session=null; me=null; saveSession(); renderAcct(); check();
+  if(t) fetch(AUTH+'/logout',{method:'POST',headers:{Authorization:'Bearer '+t}}).catch(()=>{}); }
+async function accessToken(){
+  if(!AUTH||!session) return null;
+  if(session.expires_at-60<Date.now()/1000){
+    const r=await fetch(AUTH+'/token?grant_type=refresh_token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({refresh_token:session.refresh_token})}).catch(()=>null);
+    if(!r||!r.ok){ logout(); return null; }
+    setSession(await r.json());
+  }
+  return session.access_token;
+}
+async function api(path,opt={}){
+  const t=await accessToken(); const headers=Object.assign({},opt.headers||{}); if(t) headers.Authorization='Bearer '+t;
+  const r=await fetch(API+path,Object.assign({},opt,{headers}));
+  if(r.status===401&&AUTH){ logout(); }
+  return r;
+}
+async function refreshMe(){ if(!AUTH||!session){ renderAcct(); return; }
+  const r=await api('/api/me').catch(()=>null); me=r&&r.ok?await r.json():null; renderAcct(); check(); }
+function renderAcct(){
+  const el=$('#acct'); if(!AUTH){ el.classList.add('hidden'); return; } el.classList.remove('hidden');
+  if(!session){ el.innerHTML=`<button class="kakao" id="login">카카오로 로그인</button><span>로그인하면 하루 ${ENV.user_daily||3}곡까지 무료로 만들 수 있어요.</span>`;
+    $('#login').onclick=login; return; }
+  if(!me){ el.textContent='계정 확인 중…'; return; }
+  const u=me.usage; el.innerHTML=`<span><b>${esc(me.name||'카카오 사용자')}</b> 님</span>
+    <span>오늘 ${u.used}/${u.limit}곡 사용${u.total_used>=u.total_limit?' · 오늘 전체 처리량이 찼어요':''}</span>
+    <button class="lnk" id="logout">로그아웃</button><button class="lnk" id="withdraw">탈퇴</button>`;
+  $('#logout').onclick=logout;
+  $('#withdraw').onclick=async()=>{ if(!confirm('탈퇴하면 카카오 연결과 계정 정보가 바로 지워져요. 진행할까요?')) return;
+    const r=await api('/api/me',{method:'DELETE'}); if(r.ok||r.status===204){ alert('탈퇴했어요.'); logout(); } else fail(r); };
+}
+function esc(t){ return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+let ENV={};
 
 /* ---- env ---- */
 fetch(API+'/api/env').then(r=>r.json()).then(e=>{
-  PUBLIC=!!e.public;
+  ENV=e; PUBLIC=!!e.public; refreshMe();
   if(PUBLIC){ $('#advanced').classList.add('hidden'); $('#rights').classList.remove('hidden'); $('#env').textContent=`파일 ${e.max_upload_mb}MB 이하`; check(); return; }
   $('#env').innerHTML=`Whisper <span class="pill ${e.whisper?'on':'off'}">${e.whisper?'설치됨':'미설치'}</span> Demucs <span class="pill ${e.demucs?'on':'off'}">${e.demucs?'설치됨':'미설치'}</span>`;
   if(!e.whisper){ $('#demo-box').classList.remove('hidden'); if(e.demo_truth_dir) $('#truth').placeholder=e.demo_truth_dir+'/1.json'; }
@@ -626,34 +680,58 @@ function setFile(f){ if(!f) return; audioFile=f; uploadId=null;
   $('#fileinfo').textContent=`${f.name} · ${(f.size/1048576).toFixed(1)} MB`; check(); }
 $('#lyrics').oninput=()=>{ const n=$('#lyrics').value.split('\n').filter(l=>l.trim()&&!/^\s*[\[\(].*[\]\)]\s*$/.test(l)).length;
   $('#lyricinfo').textContent=n?`${n} 라인`:''; check(); };
-function check(){ $('#start').disabled=!(audioFile&&$('#lyrics').value.trim()&&(!PUBLIC||$('#rights-ok').checked)); }
+function check(){ const quotaOk=!AUTH||(session&&me&&me.usage.left>0);
+  $('#start').disabled=!(audioFile&&$('#lyrics').value.trim()&&(!PUBLIC||$('#rights-ok').checked)&&quotaOk); }
 async function fail(r){ let m='요청을 처리하지 못했어요'; try{ m=(await r.json()).error||m; }catch(_){}
   alert(m); $('#start').textContent='싱크 시작'; check(); }
 
 $('#start').onclick=()=>startJob().catch(()=>{ alert('서버에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.'); $('#start').textContent='싱크 시작'; check(); });
+async function wakeGpu(){
+  /* 콜드 스타트(1~2분)를 업로드 요청 안에서 기다리지 않도록 GPU 를 먼저 깨운다 */
+  let r=await api('/api/warm',{method:'POST'}); if(!r.ok) return r;
+  for(let i=0;i<120;i++){ const s=(await r.json()).gpu; if(s==='ready') return null;
+    $('#start').textContent='처리 서버 준비 중… (처음엔 1~2분)'; await new Promise(f=>setTimeout(f,3000));
+    r=await api('/api/me'); if(!r.ok) return r; }
+  return null;
+}
 async function startJob(){
-  $('#start').disabled=true; $('#start').textContent='업로드 중…';
+  $('#start').disabled=true;
+  if(AUTH){ const bad=await wakeGpu(); if(bad) return fail(bad); }
+  $('#start').textContent='업로드 중…';
   if(!uploadId){
-    const r=await fetch(API+'/api/upload?name='+encodeURIComponent(audioFile.name),{method:'PUT',body:audioFile});
+    const r=await api('/api/upload?name='+encodeURIComponent(audioFile.name),{method:'PUT',body:audioFile});
     if(!r.ok) return fail(r);
     uploadId=(await r.json()).upload;
   }
   const body={upload:uploadId,lyrics:$('#lyrics').value,language:$('#lang').value||null,model:$('#model').value,aligner:$('#aligner').value,guide:$('#guide').value,ctc_backend:$('#ctc_backend').value,lead:parseFloat($('#lead').value)||0,
               separate:$('#sep').checked,simulate_truth:$('#truth').value||null};
-  const r=await fetch(API+'/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-  if(!r.ok) return fail(r);
-  job=(await r.json()).id; $('#start').textContent='싱크 시작';
+  const r=await api('/api/jobs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok){ if(r.status===400) uploadId=null; refreshMe(); return fail(r); }
+  job=(await r.json()).id; $('#start').textContent='싱크 시작'; refreshMe();
   showView(2); listen();
 }
 
 /* ---- progress ---- */
 function showView(n){ [1,2,3].forEach(i=>{ $('#s'+i).classList.toggle('cur',i===n); });
   $('#view-input').classList.toggle('hidden',n!==1); $('#view-progress').classList.toggle('hidden',n!==2); $('#view-result').classList.toggle('hidden',n!==3); }
-function listen(){
-  if(es) es.close();
-  es=new EventSource(`${API}/api/jobs/${job}/events`);
-  es.onmessage=e=>{ const s=JSON.parse(e.data); render(s); if(s.state==='done'){ es.close(); setTimeout(loadResult,600);} if(s.state==='error') es.close(); };
-  es.onerror=()=>{ es.close(); setTimeout(()=>fetch(`${API}/api/jobs/${job}`).then(r=>r.json()).then(s=>{render(s); if(s.state==='done') loadResult(); else if(s.state!=='error') listen();}),1500); };
+/* 진행 상황(SSE)은 로그인 토큰을 헤더로 보내야 해서 EventSource 대신 fetch 스트림으로 읽는다 */
+async function listen(){
+  if(ctl) ctl.abort(); const c=ctl=new AbortController(), id=job;
+  try{
+    const r=await api(`/api/jobs/${id}/events`,{signal:c.signal}); if(!r.ok||!r.body) throw new Error('sse');
+    const rd=r.body.getReader(), dec=new TextDecoder(); let buf='';
+    for(;;){ const {value,done}=await rd.read(); if(done) break;
+      buf+=dec.decode(value,{stream:true}).replace(/\r/g,''); let i;
+      while((i=buf.indexOf('\n\n'))>=0){
+        const data=buf.slice(0,i).split('\n').filter(l=>l.startsWith('data:')).map(l=>l.slice(5).trimStart()).join('\n'); buf=buf.slice(i+2);
+        if(!data) continue; const s=JSON.parse(data); render(s);
+        if(s.state==='done'){ c.abort(); setTimeout(loadResult,600); return; }
+        if(s.state==='error'){ c.abort(); api(`/api/jobs/${id}`).finally(refreshMe); return; }   // 오류로 끝난 곡은 횟수를 돌려받는다
+      } }
+  }catch(e){ if(c.signal.aborted) return; }
+  if(c!==ctl||id!==job) return;
+  setTimeout(()=>api(`/api/jobs/${id}`).then(r=>r.json()).then(s=>{ render(s); if(s.state==='done') loadResult(); else if(s.state==='error') refreshMe(); else listen(); })
+    .catch(()=>setTimeout(listen,3000)),1500);
 }
 function fmtT(s){ return s==null?'':(s<60?s.toFixed(1)+'s':Math.floor(s/60)+'m '+(s%60).toFixed(0)+'s'); }
 function render(s){
@@ -666,14 +744,15 @@ function render(s){
       <div class="t">${st.seconds!=null?fmtT(st.seconds):(st.status==='running'?Math.round(st.pct*100)+'%':'')}</div></div>`; }).join('');
   const err=$('#p-error'); err.classList.toggle('hidden',!s.error); err.textContent=s.error||'';
 }
-$('#p-back').onclick=$('#r-back').onclick=()=>{ if(es) es.close(); showView(1); check(); };
+$('#p-back').onclick=$('#r-back').onclick=()=>{ if(ctl) ctl.abort(); showView(1); refreshMe(); check(); };
 
 /* ---- result ---- */
 async function loadResult(){
-  const r=await fetch(`${API}/api/jobs/${job}/result`); lines=(await r.json()).lines;
-  const snap=await (await fetch(`${API}/api/jobs/${job}`)).json(); const su=snap.summary||{};
+  const r=await api(`/api/jobs/${job}/result`); lines=(await r.json()).lines;
+  const snap=await (await api(`/api/jobs/${job}`)).json(); const su=snap.summary||{};
   $('#r-summary').innerHTML=`<b style="color:var(--fg)">${snap.audio_name}</b> — ${su.lines} 라인 · 인식 단어 ${su.words} · 낮은 신뢰도 ${su.low_confidence} · 보간 ${su.interpolated} · ${fmtT(snap.elapsed)} 소요`;
-  const audioUrl=`${API}/api/jobs/${job}/audio`;
+  /* 재생은 올린 파일을 그대로 쓴다 (서버에서 다시 받지 않음) */
+  if(audioBlobUrl) URL.revokeObjectURL(audioBlobUrl); audioBlobUrl=URL.createObjectURL(audioFile); const audioUrl=audioBlobUrl;
   $('#player').src=audioUrl; drawLines(); showView(3);
   kara.setLines(lines); ed.setLines(lines); ed.load(audioUrl);
 }
@@ -709,19 +788,26 @@ $('#lines').onclick=e=>{ const row=e.target.closest('.ln'); if(!row) return; con
   ed.select(i,true); $('#player').play(); };
 
 /* export: if user nudged lines, build client-side so edits are kept */
+async function serverExport(fmt){
+  const r=await api(`/api/jobs/${job}/export?fmt=${fmt}`); if(!r.ok) return fail(r);
+  const m=/filename="?([^"]+)"?/.exec(r.headers.get('Content-Disposition')||'');
+  const a=document.createElement('a'); a.href=URL.createObjectURL(await r.blob()); a.download=m?m[1]:`lyrics.${fmt}`; a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),10000);
+}
 document.querySelectorAll('[data-fmt]').forEach(b=>b.onclick=()=>{
-  const fmt=b.dataset.fmt; if(!lines.some(l=>l._edited)){ location.href=`${API}/api/jobs/${job}/export?fmt=${fmt}`; return; }
+  const fmt=b.dataset.fmt; if(!lines.some(l=>l._edited)){ serverExport(fmt); return; }
   let text='';
   if(fmt==='lrc') text=lines.map(l=>`[${ts(l.start)}]${l.text}`).join('\n');
   else if(fmt==='elrc') text=lines.map(l=>`[${ts(l.start)}]`+(l.words||[]).map(w=>`<${ts(w.start)}>${w.text}`).join(' ')).join('\n');
   else if(fmt==='json') text=JSON.stringify(lines,null,1);
   else if(fmt==='srt') text=lines.map((l,i)=>{ const e=Math.min(l.end>l.start?l.end:l.start+2, lines[i+1]?lines[i+1].start:1e9); const f=t=>{const h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=t%60;return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(Math.floor(s)).padStart(2,'0')},${String(Math.round(s%1*1000)).padStart(3,'0')}`}; return `${i+1}\n${f(l.start)} --> ${f(e)}\n${l.text}\n`; }).join('\n');
-  else { alert('ASS는 서버 내보내기만 지원(수정 전 값)'); location.href=`${API}/api/jobs/${job}/export?fmt=ass`; return; }
+  else { alert('ASS는 서버 내보내기만 지원(수정 전 값)'); serverExport('ass'); return; }
   const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([text],{type:'text/plain'})); a.download=`lyrics.${fmt==='elrc'?'lrc':fmt}`; a.click();
 });
 </script>
 <footer style="max-width:1080px;margin:0 auto;padding:8px 22px 40px;font-size:12px;color:var(--mut)">
   직접 만들었거나 사용 허락을 받은 음원만 올려 주세요. 올린 파일은 싱크 처리에만 쓰이고 30분 안에 삭제돼요.
+  · <a href="/terms/lyricsync.html" style="color:var(--mut)">이용약관</a>
   · <a href="/privacy/lyricsync.html" style="color:var(--mut)">개인정보처리방침</a>
   · <a href="/apps/" style="color:var(--mut)">Dotorio Labs</a>
 </footer>
