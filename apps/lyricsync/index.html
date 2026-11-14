@@ -35,6 +35,13 @@
   .acct{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;font-size:13px;color:var(--mut)}
   .acct b{color:var(--fg)} .acct .lnk{background:none;border:0;padding:0;color:var(--mut);font-weight:400;text-decoration:underline;cursor:pointer}
   button.kakao{background:#fee500;color:#191600}
+  .gate{max-width:520px;margin:48px auto;text-align:center;padding:36px 28px}
+  .gate h2{margin:0 0 8px;font-size:24px} .gate p{color:var(--mut);margin:0 0 22px}
+  .gate ul{list-style:none;padding:0;margin:0 0 26px;text-align:left;display:grid;gap:8px;font-size:14px}
+  .gate li::before{content:'✓';color:var(--ok);margin-right:8px}
+  .gate button.kakao{width:100%;padding:14px;font-size:16px}
+  .gate .fine{font-size:12px;color:var(--mut);margin-top:16px}
+  .gate .fine a{color:var(--mut)}
   .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
   /* progress */
   .stage{display:grid;grid-template-columns:28px 1fr 90px;gap:12px;align-items:center;padding:12px 0;border-bottom:1px solid var(--line)}
@@ -71,6 +78,19 @@
   <div class="env" id="env"></div>
 </header>
 <main>
+  <section id="gate" class="card gate hidden">
+    <h2>음원과 가사로 싱크 가사 만들기</h2>
+    <p>카카오 계정으로 로그인하면 바로 쓸 수 있어요.</p>
+    <ul>
+      <li>LRC · SRT · ASS(가라오케) · JSON 으로 내보내기</li>
+      <li>줄·단어 단위 타이밍, 파형 보며 직접 고치기</li>
+      <li>하루 <b id="gate-daily">3</b>곡까지 무료</li>
+      <li>올린 음원은 처리 후 30분 안에 자동 삭제</li>
+    </ul>
+    <button class="kakao" id="gate-login">카카오로 시작하기</button>
+    <div class="fine">카카오에서는 닉네임만 받아요. 로그인하면 <a href="/terms/lyricsync.html">이용약관</a>과 <a href="/privacy/lyricsync.html">개인정보처리방침</a>에 동의하는 것으로 봐요.</div>
+  </section>
+  <div id="app">
   <div id="acct" class="acct hidden"></div>
   <div class="steps"><span id="s1" class="cur">1 입력</span><span id="s2">2 진행</span><span id="s3">3 결과</span></div>
 
@@ -145,6 +165,7 @@
       <button class="ghost" id="r-back">새 작업</button>
     </div>
   </section>
+  </div>
 </main>
 
 <script>
@@ -622,10 +643,12 @@ if(AUTH){
   try{ session=JSON.parse(localStorage.getItem(SKEY)); }catch(_){}
   const h=new URLSearchParams(location.hash.slice(1));
   if(h.get('access_token')) setSession(Object.fromEntries(h));
-  if(h.get('error_description')) setTimeout(()=>alert('로그인하지 못했어요: '+h.get('error_description')),0);
-  if(location.hash) history.replaceState(null,'',location.pathname+location.search);
+  const q=new URLSearchParams(location.search), err=h.get('error_description')||q.get('error_description')||h.get('error')||q.get('error');
+  if(err) setTimeout(()=>alert('로그인하지 못했어요. 잠시 후 다시 시도해 주세요.\n('+err+')'),0);
+  if(location.hash||q.has('error')) history.replaceState(null,'',location.pathname);
 }
-function login(){ location.href=`${AUTH}/authorize?provider=kakao&redirect_to=${encodeURIComponent(location.origin+location.pathname)}`; }
+/* 카카오는 로그인 서버에 커스텀 OIDC(custom:kakao, 닉네임만)로 등록돼 있다 */
+function login(){ location.href=`${AUTH}/authorize?provider=${encodeURIComponent('custom:kakao')}&redirect_to=${encodeURIComponent(location.origin+location.pathname)}`; }
 async function logout(){ const t=session&&session.access_token; session=null; me=null; saveSession(); renderAcct(); check();
   if(t) fetch(AUTH+'/logout',{method:'POST',headers:{Authorization:'Bearer '+t}}).catch(()=>{}); }
 async function accessToken(){
@@ -646,9 +669,11 @@ async function api(path,opt={}){
 async function refreshMe(){ if(!AUTH||!session){ renderAcct(); return; }
   const r=await api('/api/me').catch(()=>null); me=r&&r.ok?await r.json():null; renderAcct(); check(); }
 function renderAcct(){
-  const el=$('#acct'); if(!AUTH){ el.classList.add('hidden'); return; } el.classList.remove('hidden');
-  if(!session){ el.innerHTML=`<button class="kakao" id="login">카카오로 로그인</button><span>로그인하면 하루 ${ENV.user_daily||3}곡까지 무료로 만들 수 있어요.</span>`;
-    $('#login').onclick=login; return; }
+  const el=$('#acct'); if(!AUTH){ el.classList.add('hidden'); return; }
+  /* 로그인 전에는 소개·로그인 화면만, 로그인 후에 작업 화면 */
+  $('#gate').classList.toggle('hidden',!!session); $('#app').classList.toggle('hidden',!session);
+  if(!session){ $('#gate-daily').textContent=ENV.user_daily||3; $('#gate-login').onclick=login; return; }
+  el.classList.remove('hidden');
   if(!me){ el.textContent='계정 확인 중…'; return; }
   const u=me.usage; el.innerHTML=`<span><b>${esc(me.name||'카카오 사용자')}</b> 님</span>
     <span>오늘 ${u.used}/${u.limit}곡 사용${u.total_used>=u.total_limit?' · 오늘 전체 처리량이 찼어요':''}</span>
@@ -659,6 +684,7 @@ function renderAcct(){
 }
 function esc(t){ return String(t).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 let ENV={};
+if(AUTH) renderAcct();   // 첫 화면부터 로그인 여부에 맞게 (작업 화면이 잠깐 보이지 않도록)
 
 /* ---- env ---- */
 fetch(API+'/api/env').then(r=>r.json()).then(e=>{
